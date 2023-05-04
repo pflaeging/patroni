@@ -1,28 +1,12 @@
 import abc
 import logging
-import six
 
 from collections import namedtuple
-from urllib3.response import HTTPHeaderDict
 
+from ..collections import CaseInsensitiveDict
 from ..utils import parse_bool, parse_int, parse_real
 
 logger = logging.getLogger(__name__)
-
-
-class CaseInsensitiveDict(HTTPHeaderDict):
-
-    def add(self, key, val):
-        self[key] = val
-
-    def __getitem__(self, key):
-        return self._container[key.lower()][1]
-
-    def __repr__(self):
-        return str(dict(self.items()))
-
-    def copy(self):
-        return CaseInsensitiveDict(self._container.values())
 
 
 class Bool(namedtuple('Bool', 'version_from,version_till')):
@@ -34,8 +18,7 @@ class Bool(namedtuple('Bool', 'version_from,version_till')):
         logger.warning('Removing bool parameter=%s from the config due to the invalid value=%s', name, value)
 
 
-@six.add_metaclass(abc.ABCMeta)
-class Number(namedtuple('Number', 'version_from,version_till,min_val,max_val,unit')):
+class Number(abc.ABC, namedtuple('Number', 'version_from,version_till,min_val,max_val,unit')):
 
     @staticmethod
     @abc.abstractmethod

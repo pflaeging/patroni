@@ -49,7 +49,7 @@ We report new releases information `here <https://github.com/zalando/patroni/rel
 Community
 =========
 
-There are two places to connect with the Patroni community: `on github <https://github.com/zalando/patroni>`__, via Issues and PRs, and on channel `#patroni <https://postgresteam.slack.com/archives/C9XPYG92A>`__ in the `PostgreSQL Slack <https://postgresteam.slack.com/>`__.  If you're using Patroni, or just interested, please join us.
+There are two places to connect with the Patroni community: `on github <https://github.com/zalando/patroni>`__, via Issues and PRs, and on channel `#patroni <https://postgresteam.slack.com/archives/C9XPYG92A>`__ in the `PostgreSQL Slack <https://join.slack.com/t/postgresteam/shared_invite/zt-1qj14i9sj-E9WqIFlvcOiHsEk2yFEMjA>`__.  If you're using Patroni, or just interested, please join us.
 
 ===================================
 Technical Requirements/Installation
@@ -119,7 +119,7 @@ kubernetes
 raft
     `pysyncobj` module in order to use python Raft implementation as DCS
 aws
-    `boto` in order to use AWS callbacks
+    `boto3` in order to use AWS callbacks
 
 For example, the command in order to install Patroni together with dependencies for Etcd as a DCS and AWS callbacks is:
 

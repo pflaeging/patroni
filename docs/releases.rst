@@ -3,6 +3,62 @@
 Release notes
 =============
 
+Version 3.0.2
+-------------
+
+.. warning::
+    Version 3.0.2 dropped support of Python older than 3.6.
+
+
+**New features**
+
+- Added sync standby replica status to ``/metrics`` endpoint (Thomas von Dein, Alexander Kukushkin)
+
+  Before were only reporting ``primary``/``standby_leader``/``replica``.
+
+- User-friendly handling of ``PAGER`` in ``patronictl`` (Israel Barth Rubio)
+
+  It makes pager configurable via ``PAGER`` environment variable, which overrides default ``less`` and ``more``.
+
+- Make K8s retriable HTTP status code configurable (Alexander)
+
+  On some managed platforms it is possible to get status code ``401 Unauthorized``, which sometimes gets resolved after a few retries.
+
+
+**Improvements**
+
+- Set ``hot_standby`` to ``off`` during custom bootstrap only if ``recovery_target_action`` is set to ``promote`` (Alexander)
+
+  It was necessary to make ``recovery_target_action=pause`` work correctly.
+
+- Don't allow ``on_reload`` callback to kill other callbacks (Alexander)
+
+  ``on_start``/``on_stop``/``on_role_change`` are usually used to add/remove Virtual IP and ``on_reload`` should not interfere with them.
+
+- Switched to ``IMDSFetcher`` in aws callback example script (Polina Bungina)
+
+  The ``IMDSv2`` requires a token to work with and the ``IMDSFetcher`` handles it transparently.
+
+
+**Bugfixes**
+
+- Fixed ``patronictl switchover`` on Citus cluster running on Kubernetes (Lukáš Lalinský)
+
+  It didn't work for namespaces different from ``default``.
+
+- Don't write to ``PGDATA`` if major version is not known (Alexander)
+
+  If right after the start ``PGDATA`` was empty (maybe wasn't yet mounted), Patroni was making a false assumption about PostgreSQL version and falsely creating ``recovery.conf`` file even if the actual major version is v10+.
+
+- Fixed bug with Citus metadata after coordinator failover (Alexander)
+
+  The ``citus_set_coordinator_host()`` call doesn't cause metadata sync and the change was invisible on worker nodes. The issue is solved by switching to ``citus_update_node()``.
+
+- Use etcd hosts listed in the config file as a fallback when all etcd nodes "failed" (Alexander)
+
+  The etcd cluster may change topology over time and Patroni tries to follow it. If at some point all nodes became unreachable Patroni will use a combination of nodes from the config plus the last known topology when trying to reconnect.
+
+
 Version 3.0.1
 -------------
 
@@ -1629,7 +1685,7 @@ This version implements support of permanent replication slots, adds support of 
 
 - Permanent replication slots (Alexander Kukushkin)
 
-  Permanent replication slots are preserved on failover/switchover, that is, Patroni on the new primary will create configured replication slots right after doing promote. Slots could be configured with the help of `patronictl edit-config`. The initial configuration could be also done in the :ref:`bootstrap.dcs <settings>`.
+  Permanent replication slots are preserved on failover/switchover, that is, Patroni on the new primary will create configured replication slots right after doing promote. Slots could be configured with the help of `patronictl edit-config`. The initial configuration could be also done in the :ref:`bootstrap.dcs <yaml_configuration>`.
 
 - Add pgbackrest support (Yogesh Sharma)
 
@@ -2474,7 +2530,7 @@ When upgrading from v0.90 or below, always upgrade all replicas before the maste
 
   Patroni SIGHUP or POST to /reload will make it re-read the configuration file.
 
-  See the :ref:`dynamic configuration <dynamic_configuration>`  for the details on which parameters can be changed and the order of processing difference configuration sources.
+  See the :ref:`Patroni configuration <patroni_configuration>` for the details on which parameters can be changed and the order of processing difference configuration sources.
 
   The configuration file format *has changed* since the v0.90. Patroni is still compatible with the old configuration files, but in order to take advantage of the bootstrap parameters one needs to change it. Users are encourage to update them by referring to the :ref:`dynamic configuration documentation page <dynamic_configuration>`.
 

@@ -8,9 +8,8 @@ import unittest
 
 from mock import Mock, PropertyMock, mock_open, patch
 from patroni.dcs.kubernetes import Cluster, k8s_client, k8s_config, K8sConfig, K8sConnectionFailed,\
-        K8sException, K8sObject, Kubernetes, KubernetesError, KubernetesRetriableException,\
-        Retry, RetryFailedError, SERVICE_HOST_ENV_NAME, SERVICE_PORT_ENV_NAME
-from six.moves import builtins
+    K8sException, K8sObject, Kubernetes, KubernetesError, KubernetesRetriableException,\
+    Retry, RetryFailedError, SERVICE_HOST_ENV_NAME, SERVICE_PORT_ENV_NAME
 from threading import Thread
 from . import MockResponse, SleepException
 
@@ -85,7 +84,7 @@ class TestK8sConfig(unittest.TestCase):
 
         with patch('os.environ', {SERVICE_HOST_ENV_NAME: 'a', SERVICE_PORT_ENV_NAME: '1'}),\
                 patch('os.path.isfile', Mock(side_effect=[False, True, True, False, True, True, True, True])),\
-                patch.object(builtins, 'open', Mock(side_effect=[
+                patch('builtins.open', Mock(side_effect=[
                     mock_open()(), mock_open(read_data='a')(), mock_open(read_data='a')(),
                     mock_open()(), mock_open(read_data='a')(), mock_open(read_data='a')()])):
             for _ in range(0, 4):
@@ -97,7 +96,7 @@ class TestK8sConfig(unittest.TestCase):
     def test_refresh_token(self):
         with patch('os.environ', {SERVICE_HOST_ENV_NAME: 'a', SERVICE_PORT_ENV_NAME: '1'}),\
                 patch('os.path.isfile', Mock(side_effect=[True, True, False, True, True, True])),\
-                patch.object(builtins, 'open', Mock(side_effect=[
+                patch('builtins.open', Mock(side_effect=[
                     mock_open(read_data='cert')(), mock_open(read_data='a')(),
                     mock_open()(), mock_open(read_data='b')(), mock_open(read_data='c')()])):
             k8s_config.load_incluster_config(token_refresh_interval=datetime.timedelta(milliseconds=100))
@@ -122,20 +121,20 @@ class TestK8sConfig(unittest.TestCase):
             "clusters": [{"name": "local", "cluster": {"server": "https://a:1/", "certificate-authority": "a"}}],
             "users": [{"name": "local", "user": {"username": "a", "password": "b", "client-certificate": "c"}}]
         }
-        with patch.object(builtins, 'open', mock_open(read_data=json.dumps(config))):
+        with patch('builtins.open', mock_open(read_data=json.dumps(config))):
             k8s_config.load_kube_config()
             self.assertEqual(k8s_config.server, 'https://a:1')
             self.assertEqual(k8s_config.pool_config, {'ca_certs': 'a', 'cert_file': 'c', 'cert_reqs': 'CERT_REQUIRED',
                                                       'maxsize': 10, 'num_pools': 10})
 
         config["users"][0]["user"]["token"] = "token"
-        with patch.object(builtins, 'open', mock_open(read_data=json.dumps(config))):
+        with patch('builtins.open', mock_open(read_data=json.dumps(config))):
             k8s_config.load_kube_config()
             self.assertEqual(k8s_config.headers.get('authorization'), 'Bearer token')
 
         config["users"][0]["user"]["client-key-data"] = base64.b64encode(b'foobar').decode('utf-8')
         config["clusters"][0]["cluster"]["certificate-authority-data"] = base64.b64encode(b'foobar').decode('utf-8')
-        with patch.object(builtins, 'open', mock_open(read_data=json.dumps(config))),\
+        with patch('builtins.open', mock_open(read_data=json.dumps(config))),\
                 patch('os.write', Mock()), patch('os.close', Mock()),\
                 patch('os.remove') as mock_remove,\
                 patch('atexit.register') as mock_atexit,\
@@ -316,6 +315,17 @@ class TestKubernetesConfigMaps(BaseTestKubernetes):
 
     def test_set_history_value(self):
         self.k.set_history_value('{}')
+
+    @patch('patroni.dcs.kubernetes.logger.warning')
+    def test_reload_config(self, mock_warning):
+        self.k.reload_config({'loop_wait': 10, 'ttl': 30, 'retry_timeout': 10, 'retriable_http_codes': '401, 403 '})
+        self.assertEqual(self.k._api._retriable_http_codes, self.k._api._DEFAULT_RETRIABLE_HTTP_CODES | set([401, 403]))
+        self.k.reload_config({'loop_wait': 10, 'ttl': 30, 'retry_timeout': 10, 'retriable_http_codes': 402})
+        self.assertEqual(self.k._api._retriable_http_codes, self.k._api._DEFAULT_RETRIABLE_HTTP_CODES | set([402]))
+        self.k.reload_config({'loop_wait': 10, 'ttl': 30, 'retry_timeout': 10, 'retriable_http_codes': [405, 406]})
+        self.assertEqual(self.k._api._retriable_http_codes, self.k._api._DEFAULT_RETRIABLE_HTTP_CODES | set([405, 406]))
+        self.k.reload_config({'loop_wait': 10, 'ttl': 30, 'retry_timeout': 10, 'retriable_http_codes': True})
+        mock_warning.assert_called_once()
 
 
 class TestKubernetesEndpoints(BaseTestKubernetes):

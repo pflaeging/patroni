@@ -7,7 +7,6 @@ import logging
 import os
 import random
 import socket
-import six
 import tempfile
 import time
 import urllib3
@@ -15,16 +14,16 @@ import yaml
 
 from collections import defaultdict
 from copy import deepcopy
-from urllib3 import Timeout
-from urllib3.exceptions import HTTPError
-from six.moves.http_client import HTTPException
+from http.client import HTTPException
 from threading import Condition, Lock, Thread
+from typing import Any, Collection, Dict, List, Optional, Union
+from urllib3.exceptions import HTTPError
 
 from . import AbstractDCS, Cluster, ClusterConfig, Failover, Leader, Member, SyncState,\
-        TimelineHistory, CITUS_COORDINATOR_GROUP_ID, citus_group_re
+    TimelineHistory, CITUS_COORDINATOR_GROUP_ID, citus_group_re
 from ..exceptions import DCSError
 from ..utils import deep_compare, iter_response_objects, keepalive_socket_options,\
-        Retry, RetryFailedError, tzutc, uri, USER_AGENT
+    Retry, RetryFailedError, tzutc, uri, USER_AGENT
 
 logger = logging.getLogger(__name__)
 
@@ -144,7 +143,7 @@ class K8sConfig(object):
         if user.get('token'):
             self._make_headers(token=user['token'])
         elif 'username' in user and 'password' in user:
-            self._headers = self._make_headers(basic_auth=':'.join((user['username'],  user['password'])))
+            self._headers = self._make_headers(basic_auth=':'.join((user['username'], user['password'])))
 
     @property
     def server(self):
@@ -176,7 +175,7 @@ class K8sObject(object):
         if isinstance(value, dict):
             # we know that `annotations` and `labels` are dicts and therefore don't want to convert them into K8sObject
             return value if parent in {'annotations', 'labels'} and \
-                    all(isinstance(v, six.string_types) for v in value.values()) else cls(value)
+                all(isinstance(v, str) for v in value.values()) else cls(value)
         elif isinstance(value, list):
             return [cls._wrap(None, v) for v in value]
         else:
@@ -220,7 +219,7 @@ class K8sClient(object):
 
         _API_URL_PREFIX = '/api/v1/namespaces/'
 
-        def __init__(self, bypass_api_service=False):
+        def __init__(self, bypass_api_service: Optional[bool] = False) -> None:
             self._bypass_api_service = bypass_api_service
             self.pool_manager = urllib3.PoolManager(**k8s_config.pool_config)
             self._base_uri = k8s_config.server
@@ -265,7 +264,7 @@ class K8sClient(object):
         def _get_api_servers(self, api_servers_cache):
             _, per_node_timeout, per_node_retries = self._calculate_timeouts(len(api_servers_cache))
             kwargs = {'headers': self._make_headers({}), 'preload_content': True, 'retries': per_node_retries,
-                      'timeout': urllib3.Timeout(connect=max(1, per_node_timeout/2.0), total=per_node_timeout)}
+                      'timeout': urllib3.Timeout(connect=max(1, per_node_timeout / 2.0), total=per_node_timeout)}
             path = self._API_URL_PREFIX + 'default/endpoints/kubernetes'
             for base_uri in api_servers_cache:
                 try:
@@ -376,14 +375,14 @@ class K8sClient(object):
             api_servers = len(api_servers_cache)
 
             if timeout:
-                if isinstance(timeout, six.integer_types + (float,)):
+                if isinstance(timeout, (int, float)):
                     timeout = urllib3.Timeout(total=timeout)
                 elif isinstance(timeout, tuple) and len(timeout) == 2:
                     timeout = urllib3.Timeout(connect=timeout[0], read=timeout[1])
                 retries = 0
             else:
                 _, timeout, retries = self._calculate_timeouts(api_servers)
-                timeout = urllib3.Timeout(connect=max(1, timeout/2.0), total=timeout)
+                timeout = urllib3.Timeout(connect=max(1, timeout / 2.0), total=timeout)
             kwargs.update(retries=retries, timeout=timeout)
 
             while True:
@@ -406,7 +405,8 @@ class K8sClient(object):
                     retry.sleep_func(sleeptime)
                     retry.update_delay()
                     # We still have some time left. Partially reduce `api_servers_cache` and retry request
-                    kwargs.update(timeout=urllib3.Timeout(connect=max(1, timeout/2.0), total=timeout), retries=retries)
+                    kwargs.update(timeout=urllib3.Timeout(connect=max(1, timeout / 2.0), total=timeout),
+                                  retries=retries)
                     api_servers_cache = api_servers_cache[:nodes]
 
         def call_api(self, method, path, headers=None, body=None, _retry=None,
@@ -488,11 +488,15 @@ class KubernetesRetriableException(k8s_client.rest.ApiException):
 
 
 class CoreV1ApiProxy(object):
+    """Proxy class to work with k8s_client.CoreV1Api() object"""
 
-    def __init__(self, use_endpoints=False, bypass_api_service=False):
+    _DEFAULT_RETRIABLE_HTTP_CODES = frozenset([500, 503, 504])
+
+    def __init__(self, use_endpoints: Optional[bool] = False, bypass_api_service: Optional[bool] = False) -> None:
         self._api_client = k8s_client.ApiClient(bypass_api_service)
         self._core_v1_api = k8s_client.CoreV1Api(self._api_client)
         self._use_endpoints = bool(use_endpoints)
+        self._retriable_http_codes = set(self._DEFAULT_RETRIABLE_HTTP_CODES)
 
     def configure_timeouts(self, loop_wait, retry_timeout, ttl):
         # Normally every loop_wait seconds we should have receive something from the socket.
@@ -500,14 +504,25 @@ class CoreV1ApiProxy(object):
         # to start worrying (send keepalive messages). Finally, the connection should be
         # considered as dead if we received nothing from the socket after the ttl seconds.
         self._api_client.pool_manager.connection_pool_kw['socket_options'] = \
-                list(keepalive_socket_options(ttl, int(loop_wait + retry_timeout)))
+            list(keepalive_socket_options(ttl, int(loop_wait + retry_timeout)))
         self._api_client.set_read_timeout(retry_timeout)
         self._api_client.set_api_servers_cache_ttl(loop_wait)
+
+    def configure_retriable_http_codes(self, retriable_http_codes: List[int]) -> None:
+        self._retriable_http_codes = self._DEFAULT_RETRIABLE_HTTP_CODES | set(retriable_http_codes)
 
     def refresh_api_servers_cache(self):
         self._api_client.refresh_api_servers_cache()
 
-    def __getattr__(self, func):
+    def __getattr__(self, func: str):
+        """Intercepts calls to `CoreV1Api` methods.
+
+        Handles two important cases:
+        1. Depending on whether Patroni is configured to work with `ConfigMaps` or `Endpoints`
+           it remaps "virtual" method names from `*_kind` to `*_endpoints` or `*_config_map`.
+        2. It handles HTTP error codes and raises `KubernetesRetriableException`
+           if the given error is supposed to be handled with retry."""
+
         if func.endswith('_kind'):
             func = func[:-4] + ('endpoints' if self._use_endpoints else 'config_map')
 
@@ -515,7 +530,7 @@ class CoreV1ApiProxy(object):
             try:
                 return getattr(self._core_v1_api, func)(*args, **kwargs)
             except k8s_client.rest.ApiException as e:
-                if e.status in (500, 503, 504) or e.headers and 'retry-after' in e.headers:  # XXX
+                if e.status in self._retriable_http_codes or e.headers and 'retry-after' in e.headers:
                     raise KubernetesRetriableException(e)
                 raise
         return wrapper
@@ -560,7 +575,7 @@ class ObjectCache(Thread):
             raise
 
     def _watch(self, resource_version):
-        return self._func(_request_timeout=(self._retry.deadline, Timeout.DEFAULT_TIMEOUT),
+        return self._func(_request_timeout=(self._retry.deadline, urllib3.Timeout.DEFAULT_TIMEOUT),
                           _preload_content=False, watch=True, resource_version=resource_version)
 
     def set(self, name, value):
@@ -775,9 +790,23 @@ class Kubernetes(AbstractDCS):
     def set_retry_timeout(self, retry_timeout):
         self._retry.deadline = retry_timeout
 
-    def reload_config(self, config):
+    def reload_config(self, config: Dict[str, Any]) -> None:
+        """Handles dynamic config changes.
+
+        Either cause by changes in the local configuration file + SIGHUP or by changes of dynamic configuration"""
+
         super(Kubernetes, self).reload_config(config)
         self._api.configure_timeouts(self.loop_wait, self._retry.deadline, self.ttl)
+
+        # retriable_http_codes supposed to be either int, list of integers or comma-separated string with integers.
+        retriable_http_codes = config.get('retriable_http_codes', [])
+        if not isinstance(retriable_http_codes, list):
+            retriable_http_codes = [c.strip() for c in str(retriable_http_codes).split(',')]
+
+        try:
+            self._api.configure_retriable_http_codes([int(c) for c in retriable_http_codes])
+        except Exception as e:
+            logger.warning('Invalid value of retriable_http_codes = %s: %r', config['retriable_http_codes'], e)
 
     @staticmethod
     def member(pod):
@@ -877,7 +906,7 @@ class Kubernetes(AbstractDCS):
         # get synchronization state
         sync = nodes.get(path + self._SYNC)
         metadata = sync and sync.metadata
-        sync = SyncState.from_node(metadata and metadata.resource_version,  metadata and metadata.annotations)
+        sync = SyncState.from_node(metadata and metadata.resource_version, metadata and metadata.annotations)
 
         return Cluster(initialize, config, leader, last_lsn, members, failover, sync, history, slots, failsafe)
 
@@ -1238,11 +1267,26 @@ class Kubernetes(AbstractDCS):
     def set_sync_state_value(self, value, index=None):
         """Unused"""
 
-    def write_sync_state(self, leader, sync_standby, index=None):
-        return self.patch_or_create(self.sync_path, self.sync_state(leader, sync_standby), index, False)
+    def write_sync_state(self, leader: Union[str, None], sync_standby: Union[Collection[str], None],
+                         index: Optional[Union[int, str]] = None) -> bool:
+        """Prepare and write annotations to $SCOPE-sync Endpoint or ConfigMap.
 
-    def delete_sync_state(self, index=None):
-        return self.write_sync_state(None, None, index)
+        :param leader: name of the leader node that manages /sync key
+        :param sync_standby: collection of currently known synchronous standby node names
+        :param index: last known `resource_version` for conditional update of the object
+        :returns: `True` if update was successful
+        """
+        sync_state = self.sync_state(leader, sync_standby)
+        return self.patch_or_create(self.sync_path, sync_state, index, False)
+
+    def delete_sync_state(self, index: Optional[str] = None) -> bool:
+        """Patch annotations of $SCOPE-sync Endpoint or ConfigMap with empty values.
+
+        Effectively it removes "leader" and "sync_standby" annotations from the object.
+        :param index: last known `resource_version` for conditional update of the object
+        :returns: `True` if "delete" was successful
+        """
+        return self.write_sync_state(None, None, index=index)
 
     def watch(self, leader_index, timeout):
         if self.__do_not_watch:

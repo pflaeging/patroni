@@ -1,10 +1,11 @@
 import etcd
+import mock
 import os
 import unittest
 
 from click.testing import CliRunner
 from datetime import datetime, timedelta
-from mock import patch, Mock
+from mock import patch, Mock, PropertyMock
 from patroni.ctl import ctl, load_config, output_members, get_dcs, parse_dcs, \
     get_all_members, get_any_member, get_cursor, query_member, PatroniCtlException, apply_config_changes, \
     format_config_for_editing, show_diff, invoke_editor, format_pg_version, CONFIG_FILE_PATH, PatronictlPrettyTable
@@ -28,12 +29,11 @@ class TestCtl(unittest.TestCase):
     TEST_ROLES = ('master', 'primary', 'leader')
 
     @patch('socket.getaddrinfo', socket_getaddrinfo)
+    @patch.object(AbstractEtcdClientWithFailover, '_get_machines_list', Mock(return_value=['http://remotehost:2379']))
     def setUp(self):
-        with patch.object(AbstractEtcdClientWithFailover, 'machines') as mock_machines:
-            mock_machines.__get__ = Mock(return_value=['http://remotehost:2379'])
-            self.runner = CliRunner()
-            self.e = get_dcs({'etcd': {'ttl': 30, 'host': 'ok:2379', 'retry_timeout': 10},
-                              'citus': {'group': 0}}, 'foo', None)
+        self.runner = CliRunner()
+        self.e = get_dcs({'etcd': {'ttl': 30, 'host': 'ok:2379', 'retry_timeout': 10},
+                          'citus': {'group': 0}}, 'foo', None)
 
     @patch('patroni.ctl.logging.debug')
     def test_load_config(self, mock_logger_debug):
@@ -76,6 +76,7 @@ class TestCtl(unittest.TestCase):
         assert parse_dcs('zookeeper://localhost') == {'zookeeper': {'hosts': ['localhost:2181']}}
         assert parse_dcs('exhibitor://dummy') == {'exhibitor': {'hosts': ['dummy'], 'port': 8181}}
         assert parse_dcs('consul://localhost') == {'consul': {'host': 'localhost:8500'}}
+        assert parse_dcs('etcd3://random.com:2399') == {'etcd3': {'host': 'random.com:2399'}}
         self.assertRaises(PatroniCtlException, parse_dcs, 'invalid://test')
 
     def test_output_members(self):
@@ -98,7 +99,7 @@ class TestCtl(unittest.TestCase):
                                     input='leader\nother\n2300-01-01T12:23:00\ny')
         assert result.exit_code == 0
 
-        with patch('patroni.dcs.Cluster.is_paused', Mock(return_value=True)):
+        with patch('patroni.config.GlobalConfig.is_paused', PropertyMock(return_value=True)):
             result = self.runner.invoke(ctl, ['switchover', 'dummy', '--group', '0',
                                               '--force', '--scheduled', '2015-01-01T12:00:00'])
             assert result.exit_code == 1
@@ -309,7 +310,7 @@ class TestCtl(unittest.TestCase):
         result = self.runner.invoke(ctl, ['restart', 'alpha', 'other', '--force', '--scheduled', '2300-10-01T14:30'])
         assert 'Failed: flush scheduled restart' in result.output
 
-        with patch('patroni.dcs.Cluster.is_paused', Mock(return_value=True)):
+        with patch('patroni.config.GlobalConfig.is_paused', PropertyMock(return_value=True)):
             result = self.runner.invoke(ctl,
                                         ['restart', 'alpha', 'other', '--force', '--scheduled', '2300-10-01T14:30'])
             assert result.exit_code == 1
@@ -470,7 +471,7 @@ class TestCtl(unittest.TestCase):
 
         scheduled_at = datetime.now(tzutc) + timedelta(seconds=600)
         mock_get_dcs.return_value.get_cluster = Mock(
-                return_value=get_cluster_initialized_with_leader(Failover(1, 'a', 'b', scheduled_at)))
+            return_value=get_cluster_initialized_with_leader(Failover(1, 'a', 'b', scheduled_at)))
         result = self.runner.invoke(ctl, ['flush', 'dummy', 'switchover'])
         assert result.output.startswith('Success: ')
 
@@ -491,7 +492,7 @@ class TestCtl(unittest.TestCase):
         assert 'Failed' in result.output
 
         mock_post.return_value.status = 200
-        with patch('patroni.dcs.Cluster.is_paused', Mock(return_value=True)):
+        with patch('patroni.config.GlobalConfig.is_paused', PropertyMock(return_value=True)):
             result = self.runner.invoke(ctl, ['pause', 'dummy'])
             assert 'Cluster is already paused' in result.output
 
@@ -512,11 +513,11 @@ class TestCtl(unittest.TestCase):
         mock_get_dcs.return_value.get_cluster = get_cluster_initialized_with_leader
 
         mock_post.return_value.status = 200
-        with patch('patroni.dcs.Cluster.is_paused', Mock(return_value=False)):
+        with patch('patroni.config.GlobalConfig.is_paused', PropertyMock(return_value=False)):
             result = self.runner.invoke(ctl, ['resume', 'dummy'])
             assert 'Cluster is not paused' in result.output
 
-        with patch('patroni.dcs.Cluster.is_paused', Mock(return_value=True)):
+        with patch('patroni.config.GlobalConfig.is_paused', PropertyMock(return_value=True)):
             result = self.runner.invoke(ctl, ['resume', 'dummy'])
             assert 'Success' in result.output
 
@@ -559,19 +560,55 @@ class TestCtl(unittest.TestCase):
 
     @patch('sys.stdout.isatty', return_value=False)
     @patch('patroni.ctl.markup_to_pager')
-    @patch('patroni.ctl.find_executable', return_value=None)
-    def test_show_diff(self, mock_find_executable, mock_markup_to_pager, mock_isatty):
+    @patch('os.environ.get', return_value=None)
+    @patch('shutil.which', return_value=None)
+    def test_show_diff(self, mock_which, mock_env_get, mock_markup_to_pager, mock_isatty):
+        # no TTY
         show_diff("foo:\n  bar: 1\n", "foo:\n  bar: 2\n")
         mock_markup_to_pager.assert_not_called()
 
+        # TTY but no PAGER nor executable
         mock_isatty.return_value = True
+        with self.assertRaises(PatroniCtlException) as e:
+            show_diff("foo:\n  bar: 1\n", "foo:\n  bar: 2\n")
+        self.assertEqual(
+            str(e.exception),
+            'No pager could be found. Either set PAGER environment variable with '
+            'your pager or install either "less" or "more" in the host.'
+        )
+        mock_env_get.assert_called_once_with('PAGER')
+        mock_which.assert_has_calls([
+            mock.call('less'),
+            mock.call('more'),
+        ])
+        mock_markup_to_pager.assert_not_called()
+
+        # TTY with PAGER set but invalid
+        mock_env_get.reset_mock()
+        mock_env_get.return_value = 'random'
+        mock_which.reset_mock()
+        with self.assertRaises(PatroniCtlException) as e:
+            show_diff("foo:\n  bar: 1\n", "foo:\n  bar: 2\n")
+        self.assertEqual(
+            str(e.exception),
+            'No pager could be found. Either set PAGER environment variable with '
+            'your pager or install either "less" or "more" in the host.'
+        )
+        mock_env_get.assert_called_once_with('PAGER')
+        mock_which.assert_has_calls([
+            mock.call('random'),
+            mock.call('less'),
+            mock.call('more'),
+        ])
+        mock_markup_to_pager.assert_not_called()
+
+        # TTY with valid executable
+        mock_which.side_effect = [None, '/usr/bin/less', None]
         show_diff("foo:\n  bar: 1\n", "foo:\n  bar: 2\n")
         mock_markup_to_pager.assert_called_once()
 
-        show_diff("foo:\n  bar: 1\n", "foo:\n  bar: 2\n")
-
         # Test that unicode handling doesn't fail with an exception
-        mock_find_executable.return_value = '/usr/bin/less'
+        mock_which.side_effect = [None, '/usr/bin/less', None]
         show_diff(b"foo:\n  bar: \xc3\xb6\xc3\xb6\n".decode('utf-8'),
                   b"foo:\n  bar: \xc3\xbc\xc3\xbc\n".decode('utf-8'))
 
@@ -579,7 +616,7 @@ class TestCtl(unittest.TestCase):
     def test_invoke_editor(self, mock_subprocess_call):
         os.environ.pop('EDITOR', None)
         for e in ('', '/bin/vi'):
-            with patch('patroni.ctl.find_executable', Mock(return_value=e)):
+            with patch('shutil.which', Mock(return_value=e)):
                 self.assertRaises(PatroniCtlException, invoke_editor, 'foo: bar\n', 'test')
 
     @patch('patroni.ctl.get_dcs')

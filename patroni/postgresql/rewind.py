@@ -3,7 +3,6 @@ import os
 import re
 import shlex
 import shutil
-import six
 import subprocess
 
 from threading import Lock, Thread
@@ -79,9 +78,9 @@ class Rewind(object):
     def check_leader_has_run_checkpoint(conn_kwargs):
         try:
             with get_connection_cursor(connect_timeout=3, options='-c statement_timeout=2000', **conn_kwargs) as cur:
-                cur.execute("SELECT NOT pg_catalog.pg_is_in_recovery()" +
-                            " AND ('x' || pg_catalog.substr(pg_catalog.pg_walfile_name(" +
-                            " pg_catalog.pg_current_wal_lsn()), 1, 8))::bit(32)::int = timeline_id" +
+                cur.execute("SELECT NOT pg_catalog.pg_is_in_recovery()"
+                            " AND ('x' || pg_catalog.substr(pg_catalog.pg_walfile_name("
+                            " pg_catalog.pg_current_wal_lsn()), 1, 8))::bit(32)::int = timeline_id"
                             " FROM pg_catalog.pg_control_checkpoint()")
                 if not cur.fetchone()[0]:
                     return 'leader has not run a checkpoint yet'
@@ -152,7 +151,7 @@ class Rewind(object):
         else:  # otherwise analyze pg_controldata output
             in_recovery, timeline, lsn = self._get_local_timeline_lsn_from_controldata()
 
-        log_lsn = format_lsn(lsn) if isinstance(lsn, six.integer_types) else lsn
+        log_lsn = format_lsn(lsn) if isinstance(lsn, int) else lsn
         logger.info('Local timeline=%s lsn=%s', timeline, log_lsn)
         return in_recovery, timeline, lsn
 
@@ -215,7 +214,7 @@ class Rewind(object):
                 elif primary_timeline > 1:
                     cur.execute('TIMELINE_HISTORY {0}'.format(primary_timeline))
                     history = cur.fetchone()[1]
-                    if not isinstance(history, six.string_types):
+                    if not isinstance(history, str):
                         history = bytes(history).decode('utf-8')
                     logger.debug('primary: history=%s', history)
         except Exception:
@@ -385,9 +384,10 @@ class Rewind(object):
             if self._postgresql.major_version < 120000 else self._postgresql.get_guc_value('restore_command')
 
         # Until v15 pg_rewind expected postgresql.conf to be inside $PGDATA, which is not the case on e.g. Debian
-        pg_rewind_can_restore = restore_command and (self._postgresql.major_version >= 150000 or
-                                                     (self._postgresql.major_version >= 130000 and
-                                                      self._postgresql.config._config_dir == self._postgresql.data_dir))
+        pg_rewind_can_restore = restore_command and (self._postgresql.major_version >= 150000
+                                                     or (self._postgresql.major_version >= 130000
+                                                         and self._postgresql.config._config_dir
+                                                         == self._postgresql.data_dir))
 
         cmd = [self._postgresql.pgcommand('pg_rewind')]
         if pg_rewind_can_restore:
@@ -440,7 +440,7 @@ class Rewind(object):
             # superuser credentials match rewind_credentials if the latter are not provided or we run 10 or older
             if self._postgresql.config.superuser == self._postgresql.config.rewind_credentials:
                 leader_status = self._postgresql.checkpoint(
-                        self._conn_kwargs(leader, self._postgresql.config.superuser))
+                    self._conn_kwargs(leader, self._postgresql.config.superuser))
             else:  # we run 11+ and have a dedicated pg_rewind user
                 leader_status = self.check_leader_has_run_checkpoint(r)
             if leader_status:  # we tried to run/check for a checkpoint on the remote leader, but it failed

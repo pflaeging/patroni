@@ -7,18 +7,18 @@ import logging
 import os
 import pkgutil
 import re
-import six
 import sys
 import time
 
 from collections import defaultdict, namedtuple
 from copy import deepcopy
 from random import randint
-from six.moves.urllib_parse import urlparse, urlunparse, parse_qsl
 from threading import Event, Lock
+from typing import Any, Collection, Dict, List, Optional, Union
+from urllib.parse import urlparse, urlunparse, parse_qsl
 
 from ..exceptions import PatroniFatalException
-from ..utils import deep_compare, parse_bool, uri
+from ..utils import deep_compare, uri
 
 CITUS_COORDINATOR_GROUP_ID = 0
 citus_group_re = re.compile('^(0|[1-9][0-9]*)$')
@@ -353,8 +353,8 @@ class ClusterConfig(namedtuple('ClusterConfig', 'index,data,modify_index')):
     @property
     def permanent_slots(self):
         return isinstance(self.data, dict) and (
-                self.data.get('permanent_replication_slots') or
-                self.data.get('permanent_slots') or self.data.get('slots')
+            self.data.get('permanent_replication_slots')
+            or self.data.get('permanent_slots') or self.data.get('slots')
         ) or {}
 
     @property
@@ -375,7 +375,7 @@ class SyncState(namedtuple('SyncState', 'index,leader,sync_standby')):
     """
 
     @staticmethod
-    def from_node(index, value):
+    def from_node(index: Union[str, int], value: Union[str, Dict[str, Any]]) -> 'SyncState':
         """
         >>> SyncState.from_node(1, None).leader is None
         True
@@ -390,43 +390,70 @@ class SyncState(namedtuple('SyncState', 'index,leader,sync_standby')):
         >>> SyncState.from_node(1, {"leader": "leader"}).leader == "leader"
         True
         """
-        if isinstance(value, dict):
-            data = value
-        elif value:
-            try:
-                data = json.loads(value)
-                if not isinstance(data, dict):
-                    data = {}
-            except (TypeError, ValueError):
-                data = {}
-        else:
-            data = {}
-        return SyncState(index, data.get('leader'), data.get('sync_standby'))
+        try:
+            if value and isinstance(value, str):
+                value = json.loads(value)
+            if not isinstance(value, dict):
+                return SyncState.empty(index)
+            return SyncState(index, value.get('leader'), value.get('sync_standby'))
+        except (TypeError, ValueError):
+            return SyncState.empty(index)
+
+    @staticmethod
+    def empty(index: Optional[Union[str, int]] = '') -> 'SyncState':
+        return SyncState(index, None, '')
 
     @property
-    def members(self):
-        """ Returns sync_standby in list """
-        return self.sync_standby and self.sync_standby.split(',') or []
+    def is_empty(self) -> bool:
+        """:returns: True if /sync key is not valid (doesn't have a leader)."""
+        return not self.leader
 
-    def matches(self, name):
+    @staticmethod
+    def _str_to_list(value: str) -> List[str]:
+        """Splits a string by comma and returns list of strings.
+
+        :param value: a comma separated string
+        :returns: list of non-empty strings after splitting an input value by comma
         """
-        Returns if a node name matches one of the nodes in the sync state
+        return list(filter(lambda a: a, [s.strip() for s in value.split(',')]))
 
+    @property
+    def members(self) -> List[str]:
+        """:returns: sync_standby as list."""
+        return self._str_to_list(self.sync_standby) if not self.is_empty and self.sync_standby else []
+
+    def matches(self, name: Union[str, None], check_leader: Optional[bool] = False) -> bool:
+        """Checks if node is presented in the /sync state.
+
+        Since PostgreSQL does case-insensitive checks for synchronous_standby_name we do it also.
+        :param name: name of the node
+        :param check_leader: by default the name is searched in members, check_leader=True will include leader to list
+        :returns: `True` if the /sync key not :func:`is_empty` and a given name is among presented in the sync state
         >>> s = SyncState(1, 'foo', 'bar,zoo')
         >>> s.matches('foo')
+        False
+        >>> s.matches('fOo', True)
         True
-        >>> s.matches('bar')
+        >>> s.matches('Bar')
         True
-        >>> s.matches('zoo')
+        >>> s.matches('zoO')
         True
         >>> s.matches('baz')
         False
         >>> s.matches(None)
         False
-        >>> SyncState(1, None, None).matches('foo')
+        >>> SyncState.empty(1).matches('foo')
         False
         """
-        return name is not None and name in [self.leader] + self.members
+        ret = False
+        if name and not self.is_empty:
+            search_str = (self.sync_standby or '') + (',' + self.leader if check_leader else '')
+            ret = name.lower() in self._str_to_list(search_str.lower())
+        return ret
+
+    def leader_matches(self, name: Union[str, None]) -> bool:
+        """:returns: `True` if name is matching the `SyncState.leader` value."""
+        return name and not self.is_empty and name.lower() == self.leader.lower()
 
 
 class TimelineHistory(namedtuple('TimelineHistory', 'index,value,lines')):
@@ -472,6 +499,10 @@ class Cluster(namedtuple('Cluster', 'initialize,config,leader,last_lsn,members,'
             args = args + ({},)
         return super(Cluster, cls).__new__(cls, *args)
 
+    @staticmethod
+    def empty():
+        return Cluster(None, None, None, 0, [], None, SyncState.empty(), None, None, None)
+
     @property
     def leader_name(self):
         return self.leader and self.leader.name
@@ -489,15 +520,6 @@ class Cluster(namedtuple('Cluster', 'initialize,config,leader,last_lsn,members,'
         exclude = [exclude] + [self.leader.name] if self.leader else []
         candidates = [m for m in self.members if m.clonefrom and m.is_running and m.name not in exclude]
         return candidates[randint(0, len(candidates) - 1)] if candidates else self.leader
-
-    def check_mode(self, mode):
-        return bool(self.config and parse_bool(self.config.data.get(mode)))
-
-    def is_paused(self):
-        return self.check_mode('pause')
-
-    def is_synchronous_mode(self):
-        return self.check_mode('synchronous_mode')
 
     @property
     def __permanent_slots(self):
@@ -524,15 +546,15 @@ class Cluster(namedtuple('Cluster', 'initialize,config,leader,last_lsn,members,'
         # primary), or if replicatefrom destination member happens to be the current primary
         use_slots = self.use_slots
         if role in ('master', 'primary', 'standby_leader'):
-            slot_members = [m.name for m in self.members if use_slots and m.name != my_name and
-                            (m.replicatefrom is None or m.replicatefrom == my_name or
-                             not self.has_member(m.replicatefrom))]
+            slot_members = [m.name for m in self.members if use_slots and m.name != my_name
+                            and (m.replicatefrom is None or m.replicatefrom == my_name
+                                 or not self.has_member(m.replicatefrom))]
             permanent_slots = self.__permanent_slots if use_slots and \
                 role in ('master', 'primary') else self.__permanent_physical_slots
         else:
             # only manage slots for replicas that replicate from this one, except for the leader among them
-            slot_members = [m.name for m in self.members if use_slots and
-                            m.replicatefrom == my_name and m.name != self.leader_name]
+            slot_members = [m.name for m in self.members if use_slots
+                            and m.replicatefrom == my_name and m.name != self.leader_name]
             permanent_slots = self.__permanent_logical_slots if use_slots and not nofailover else {}
 
         slots = {slot_name_from_member_name(name): {'type': 'physical'} for name in slot_members}
@@ -568,7 +590,7 @@ class Cluster(namedtuple('Cluster', 'initialize,config,leader,last_lsn,members,'
                     if major_version < 110000:
                         disabled_permanent_logical_slots.append(name)
                     elif name in slots:
-                        logger.error("Permanent logical replication slot {'%s': %s} is conflicting with" +
+                        logger.error("Permanent logical replication slot {'%s': %s} is conflicting with"
                                      " physical replication slot for cluster member", name, value)
                     else:
                         slots[name] = value
@@ -654,8 +676,7 @@ def catch_return_false_exception(func):
     return wrapper
 
 
-@six.add_metaclass(abc.ABCMeta)
-class AbstractDCS(object):
+class AbstractDCS(abc.ABC):
 
     _INITIALIZE = 'initialize'
     _CONFIG = 'config'
@@ -676,7 +697,7 @@ class AbstractDCS(object):
         """
         self._name = config['name']
         self._base_path = re.sub('/+', '/', '/'.join(['', config.get('namespace', 'service'), config['scope']]))
-        self._citus_group = str(config['group']) if isinstance(config.get('group'), six.integer_types) else None
+        self._citus_group = str(config['group']) if isinstance(config.get('group'), int) else None
         self._set_loop_wait(config.get('loop_wait', 10))
 
         self._ctl = bool(config.get('patronictl', False))
@@ -814,8 +835,8 @@ class AbstractDCS(object):
         if isinstance(groups, Cluster):  # Zookeeper could return a cached version
             cluster = groups
         else:
-            cluster = groups.pop(CITUS_COORDINATOR_GROUP_ID,
-                                 Cluster(None, None, None, None, [], None, None, None, None, None))
+            assert isinstance(groups, dict)
+            cluster = groups.pop(CITUS_COORDINATOR_GROUP_ID, Cluster.empty())
             cluster.workers.update(groups)
         return cluster
 
@@ -1003,13 +1024,24 @@ class AbstractDCS(object):
         """Delete cluster from DCS"""
 
     @staticmethod
-    def sync_state(leader, sync_standby):
-        """Build sync_state dict
-           sync_standby dictionary key being kept for backward compatibility
+    def sync_state(leader: Union[str, None], sync_standby: Union[Collection[str], None]) -> Dict[str, Any]:
+        """Build sync_state dict.
+        The sync_standby key being kept for backward compatibility.
+        :param leader: name of the leader node that manages /sync key
+        :param sync_standby: collection of currently known synchronous standby node names
+        :returns: dictionary that later could be serialized to JSON or saved directly to DCS
         """
-        return {'leader': leader, 'sync_standby': sync_standby and ','.join(sorted(sync_standby)) or None}
+        return {'leader': leader, 'sync_standby': ','.join(sorted(sync_standby)) if sync_standby else None}
 
-    def write_sync_state(self, leader, sync_standby, index=None):
+    def write_sync_state(self, leader: Union[str, None], sync_standby: Union[Collection[str], None],
+                         index: Optional[Union[int, str]] = None) -> bool:
+        """Write the new synchronous state to DCS.
+        Calls :func:`sync_state` method to build a dict and than calls DCS specific :func:`set_sync_state_value` method.
+        :param leader: name of the leader node that manages /sync key
+        :param sync_standby: collection of currently known synchronous standby node names
+        :param index: for conditional update of the key/object
+        :returns: `True` if /sync key was successfully updated
+        """
         sync_value = self.sync_state(leader, sync_standby)
         return self.set_sync_state_value(json.dumps(sync_value, separators=(',', ':')), index)
 
@@ -1018,8 +1050,13 @@ class AbstractDCS(object):
         """"""
 
     @abc.abstractmethod
-    def set_sync_state_value(self, value, index=None):
-        """"""
+    def set_sync_state_value(self, value: str, index: Optional[Union[int, str]] = None) -> bool:
+        """Set synchronous state in DCS, should be implemented in the child class.
+
+        :param value: the new value of /sync key
+        :param index: for conditional update of the key/object
+        :returns: `True` if key/object was successfully updated
+        """
 
     @abc.abstractmethod
     def delete_sync_state(self, index=None):

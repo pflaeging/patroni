@@ -22,19 +22,18 @@ Currently supported PostgreSQL versions: 9.3 to 15.
    :caption: Contents:
 
    README
-   citus
-   dynamic_configuration
-   dcs_failsafe_mode
+   patroni_configuration
    rest_api
-   existing_data
-   ENVIRONMENT
-   SETTINGS
-   security
    replica_bootstrap
    replication_modes
-   pause
-   kubernetes
    watchdog
+   pause
+   dcs_failsafe_mode
+   kubernetes
+   citus
+   existing_data
+   security
+   ha_multi_dc
    releases
    CONTRIBUTING
 

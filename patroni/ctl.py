@@ -4,28 +4,30 @@ Patroni Control
 
 import click
 import codecs
+import copy
 import datetime
 import dateutil.parser
 import dateutil.tz
-import copy
 import difflib
 import io
 import json
 import logging
 import os
 import random
-import six
+import shutil
 import subprocess
 import sys
 import tempfile
 import time
 import yaml
 
+from typing import Any, Dict, Union
+
 from click import ClickException
 from collections import defaultdict
 from contextlib import contextmanager
 from prettytable import ALL, FRAME, PrettyTable
-from six.moves.urllib_parse import urlparse
+from urllib.parse import urlparse
 
 try:
     from ydiff import markup_to_pager, PatchStream
@@ -35,7 +37,7 @@ except ImportError:  # pragma: no cover
 from .dcs import get_dcs as _get_dcs
 from .exceptions import PatroniException
 from .postgresql.misc import postgres_version_to_int
-from .utils import cluster_as_json, find_executable, patch_config, polling_loop, is_standby_cluster
+from .utils import cluster_as_json, patch_config, polling_loop
 from .request import PatroniRequest
 from .version import __version__
 
@@ -44,7 +46,8 @@ CONFIG_FILE_PATH = os.path.join(CONFIG_DIR_PATH, 'patronictl.yaml')
 DCS_DEFAULTS = {'zookeeper': {'port': 2181, 'template': "zookeeper:\n hosts: ['{host}:{port}']"},
                 'exhibitor': {'port': 8181, 'template': "exhibitor:\n hosts: [{host}]\n port: {port}"},
                 'consul': {'port': 8500, 'template': "consul:\n host: '{host}:{port}'"},
-                'etcd': {'port': 2379, 'template': "etcd:\n host: '{host}:{port}'"}}
+                'etcd': {'port': 2379, 'template': "etcd:\n host: '{host}:{port}'"},
+                'etcd3': {'port': 2379, 'template': "etcd3:\n host: '{host}:{port}'"}}
 
 
 class PatroniCtlException(ClickException):
@@ -90,7 +93,38 @@ class PatronictlPrettyTable(PrettyTable):
     _hrule = property(_get_hline, _set_hline)
 
 
-def parse_dcs(dcs):
+def parse_dcs(dcs: str) -> Union[Dict[str, Any], None]:
+    """Parse a DCS URL.
+
+    :param dcs: the DCS URL in the format ``DCS://HOST:PORT``. ``DCS`` can be one among
+        * ``consul``
+        * ``etcd``
+        * ``etcd3``
+        * ``exhibitor``
+        * ``zookeeper``
+
+        If ``DCS`` is not specified, it assumes ``etcd`` by default. If ``HOST`` is not specified, it assumes
+        ``localhost`` by default. If ``PORT`` is not specified, it assumes the default port of the given ``DCS``.
+
+    :returns: ``None`` if *dcs* is ``None``, otherwise a dictionary. The dictionary represents *dcs* as if it were
+        parsed from the Patroni configuration file.
+
+    :raises PatroniCtlException: if the DCS name in *dcs* is not valid.
+
+    :Example:
+
+        >>> parse_dcs('')
+        {'etcd': {'host': 'localhost:2379'}}
+
+        >>> parse_dcs('etcd://:2399')
+        {'etcd': {'host': 'localhost:2399'}}
+
+        >>> parse_dcs('etcd://test')
+        {'etcd': {'host': 'test:2379'}}
+
+        >>> parse_dcs('etcd3://random.com:2399')
+        {'etcd3': {'host': 'random.com:2399'}}
+    """
     if dcs is None:
         return None
     elif '//' not in dcs:
@@ -203,7 +237,7 @@ def print_output(columns, rows, alignment=None, fmt='pretty', header=None, delim
             for r in ([columns] if columns else []) + rows:
                 click.echo(delimiter.join(map(str, r)))
         else:
-            hrules = ALL if any(any(isinstance(c, six.string_types) and '\n' in c for c in r) for r in rows) else FRAME
+            hrules = ALL if any(any(isinstance(c, str) and '\n' in c for c in r) for r in rows) else FRAME
             table = PatronictlPrettyTable(header, columns, hrules=hrules)
             table.align = 'l'
             for k, v in (alignment or {}).items():
@@ -249,9 +283,9 @@ def get_all_members(obj, cluster, group, role='leader'):
         role = {'primary': 'master', 'standby-leader': 'standby_leader'}.get(role, role)
         for cluster in clusters.values():
             if cluster.leader is not None and cluster.leader.name and\
-                    (role == 'leader' or
-                     cluster.leader.data.get('role') != 'master' and role == 'standby_leader' or
-                     cluster.leader.data.get('role') != 'standby_leader' and role == 'master'):
+                    (role == 'leader'
+                     or cluster.leader.data.get('role') != 'master' and role == 'standby_leader'
+                     or cluster.leader.data.get('role') != 'standby_leader' and role == 'master'):
                 yield cluster.leader.member
         return
 
@@ -531,7 +565,8 @@ def parse_scheduled(scheduled):
 @option_force
 @click.pass_obj
 def reload(obj, cluster_name, member_names, group, force, role):
-    cluster = get_dcs(obj, cluster_name, group).get_cluster()
+    dcs = get_dcs(obj, cluster_name, group)
+    cluster = dcs.get_cluster()
 
     members = get_members(obj, cluster, cluster_name, member_names, role, force, 'reload', group=group)
 
@@ -541,7 +576,7 @@ def reload(obj, cluster_name, member_names, group, force, role):
             click.echo('No changes to apply on member {0}'.format(member.name))
         elif r.status == 202:
             click.echo('Reload request received for member {0} and will be processed within {1} seconds'.format(
-                member.name, cluster.config.data.get('loop_wait'))
+                member.name, cluster.config.data.get('loop_wait', dcs.loop_wait))
             )
         else:
             click.echo('Failed: reload for member {0}, status code={1}, ({2})'.format(
@@ -597,7 +632,8 @@ def restart(obj, cluster_name, group, member_names, force, role, p_any, schedule
         content['postgres_version'] = version
 
     if scheduled_at:
-        if cluster.is_paused():
+        from patroni.config import get_global_config
+        if get_global_config(cluster).is_paused:
             raise PatroniCtlException("Can't schedule restart in the paused state")
         content['schedule'] = scheduled_at.isoformat()
 
@@ -691,7 +727,8 @@ def _do_failover_or_switchover(obj, action, cluster_name, group, leader, candida
         if force or action == 'failover':
             leader = cluster.leader and cluster.leader.name
         else:
-            prompt = 'Standby Leader' if is_standby_cluster(cluster.config) else 'Primary'
+            from patroni.config import get_global_config
+            prompt = 'Standby Leader' if get_global_config(cluster).is_standby_cluster else 'Primary'
             leader = click.prompt(prompt, type=str, default=cluster.leader.member.name)
 
     if leader is not None and cluster.leader and cluster.leader.member.name != leader:
@@ -728,7 +765,8 @@ def _do_failover_or_switchover(obj, action, cluster_name, group, leader, candida
 
         scheduled_at = parse_scheduled(scheduled)
         if scheduled_at:
-            if cluster.is_paused():
+            from patroni.config import get_global_config
+            if get_global_config(cluster).is_paused:
                 raise PatroniCtlException("Can't schedule switchover in the paused state")
             scheduled_at_str = scheduled_at.isoformat()
 
@@ -875,7 +913,7 @@ def output_members(obj, cluster, name, extended=False, fmt='pretty', group=None)
             member.update(cluster=name, member=member['name'], group=g,
                           host=member.get('host', ''), tl=member.get('timeline', ''),
                           role=member['role'].replace('_', ' ').title(),
-                          lag_in_mb=round(lag/1024/1024) if isinstance(lag, six.integer_types) else lag,
+                          lag_in_mb=round(lag / 1024 / 1024) if isinstance(lag, int) else lag,
                           pending_restart='*' if member.get('pending_restart') else '')
 
             if append_port and member['host'] and member.get('port'):
@@ -1008,9 +1046,10 @@ def wait_until_pause_is_applied(dcs, paused, old_cluster):
 
 
 def toggle_pause(config, cluster_name, group, paused, wait):
+    from patroni.config import get_global_config
     dcs = get_dcs(config, cluster_name, group)
     cluster = dcs.get_cluster()
-    if cluster.is_paused() == paused:
+    if get_global_config(cluster).is_paused == paused:
         raise PatroniCtlException('Cluster is {0} paused'.format(paused and 'already' or 'not'))
 
     for member in get_all_members_leader_first(cluster):
@@ -1084,8 +1123,7 @@ def show_diff(before_editing, after_editing):
     if sys.stdout.isatty():
         buf = io.StringIO()
         for line in unified_diff:
-            # Force cast to unicode as difflib on Python 2.7 returns a mix of unicode and str.
-            buf.write(six.text_type(line))
+            buf.write(str(line))
         buf.seek(0)
 
         class opts:
@@ -1093,11 +1131,27 @@ def show_diff(before_editing, after_editing):
             width = 80
             tab_width = 8
             wrap = True
-            if find_executable('less'):
-                pager = None
-            else:
-                pager = 'more.com' if sys.platform == 'win32' else 'more'
+            pager = next(
+                (
+                    os.path.basename(p)
+                    for p in (os.environ.get('PAGER'), "less", "more")
+                    if p is not None and shutil.which(p)
+                ),
+                None,
+            )
             pager_options = None
+
+        if opts.pager is None:
+            raise PatroniCtlException(
+                'No pager could be found. Either set PAGER environment variable with '
+                'your pager or install either "less" or "more" in the host.'
+            )
+
+        # if we end up selecting "less" as "pager" then we set "pager" attribute
+        # to "None". "less" is the default pager for "ydiff" module, and that
+        # module adds some command-line options to "less" when "pager" is "None"
+        if opts.pager == 'less':
+            opts.pager = None
 
         markup_to_pager(PatchStream(buf), opts)
     else:
@@ -1184,7 +1238,7 @@ def invoke_editor(before_editing, cluster_name):
     editor_cmd = os.environ.get('EDITOR')
     if not editor_cmd:
         for editor in ('editor', 'vi'):
-            editor_cmd = find_executable(editor)
+            editor_cmd = shutil.which(editor)
             if editor_cmd:
                 logging.debug('Setting fallback editor_cmd=%s', editor)
                 break
@@ -1234,7 +1288,7 @@ def edit_config(obj, cluster_name, group, force, quiet, kvpairs, pgkvpairs, appl
         after_editing, changed_data = apply_yaml_file(changed_data, apply_filename)
 
     if kvpairs or pgkvpairs:
-        all_pairs = list(kvpairs) + ['postgresql.parameters.'+v.lstrip() for v in pgkvpairs]
+        all_pairs = list(kvpairs) + ['postgresql.parameters.' + v.lstrip() for v in pgkvpairs]
         after_editing, changed_data = apply_config_changes(before_editing, changed_data, all_pairs)
 
     # If no changes were specified on the command line invoke editor

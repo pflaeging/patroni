@@ -3,7 +3,6 @@ from mock import Mock, PropertyMock, patch, mock_open
 from patroni.postgresql import Postgresql
 from patroni.postgresql.cancellable import CancellableSubprocess
 from patroni.postgresql.rewind import Rewind
-from six.moves import builtins
 
 from . import BaseTestPostgresql, MockCursor, psycopg_connect
 
@@ -21,8 +20,8 @@ class MockThread(object):
 def mock_cancellable_call(*args, **kwargs):
     communicate = kwargs.pop('communicate', None)
     if isinstance(communicate, dict):
-        communicate.update(stdout=b'', stderr=b'pg_rewind: error: could not open file ' +
-                                              b'"data/postgresql0/pg_xlog/000000010000000000000003": No such file')
+        communicate.update(stdout=b'', stderr=b'pg_rewind: error: could not open file '
+                           + b'"data/postgresql0/pg_xlog/000000010000000000000003": No such file')
     return 1
 
 
@@ -193,7 +192,7 @@ class TestRewind(BaseTestPostgresql):
         m = mock_open(read_data='/usr/lib/postgres/9.6/bin/postgres "-D" "data/postgresql0" \
 "--listen_addresses=127.0.0.1" "--port=5432" "--hot_standby=on" "--wal_level=hot_standby" \
 "--wal_log_hints=on" "--max_wal_senders=5" "--max_replication_slots=5"\n')
-        with patch.object(builtins, 'open', m):
+        with patch('builtins.open', m):
             data = self.r.read_postmaster_opts()
             self.assertEqual(data['wal_level'], 'hot_standby')
             self.assertEqual(int(data['max_replication_slots']), 5)
@@ -223,7 +222,7 @@ class TestRewind(BaseTestPostgresql):
     @patch('patroni.postgresql.rewind.logger.info')
     def test_archive_ready_wals(self, mock_logger_info):
         with patch('os.listdir', Mock(side_effect=OSError)), \
-              patch.object(Postgresql, 'get_guc_value', Mock(side_effect=['on', 'command %f'])):
+             patch.object(Postgresql, 'get_guc_value', Mock(side_effect=['on', 'command %f'])):
             self.r._archive_ready_wals()
             mock_logger_info.assert_not_called()
 
@@ -233,19 +232,19 @@ class TestRewind(BaseTestPostgresql):
             'on', '',
         ]
         with patch.object(Postgresql, 'get_guc_value', Mock(side_effect=get_guc_value_res)):
-            for _ in range(len(get_guc_value_res)//2):
+            for _ in range(len(get_guc_value_res) // 2):
                 self.r._archive_ready_wals()
                 mock_logger_info.assert_not_called()
 
         with patch('os.listdir', Mock(return_value=['000000000000000000000000.ready'])):
             # successful archive_command call
-            with patch.object(CancellableSubprocess, 'call',  Mock(return_value=0)):
+            with patch.object(CancellableSubprocess, 'call', Mock(return_value=0)):
                 get_guc_value_res = [
                     'on', 'command %f',
                     'always', 'command %f',
                 ]
                 with patch.object(Postgresql, 'get_guc_value', Mock(side_effect=get_guc_value_res)):
-                    for _ in range(len(get_guc_value_res)//2):
+                    for _ in range(len(get_guc_value_res) // 2):
                         self.r._archive_ready_wals()
                         mock_logger_info.assert_called_once()
                         self.assertEqual(('Trying to archive %s: %s',
